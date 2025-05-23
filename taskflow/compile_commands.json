@@ -1,0 +1,7 @@
+[
+  {
+    "directory": "/heorot/lchang21/taskflow-taskbench/task-bench-taskflow/taskflow",
+    "command": "g++ -c -std=c++17 -Wall -pthread -O3 -march=native -I../core -I/heorot/lchang21/taskflow/taskflow main.cpp -o main.o",
+    "file": "main.cpp"
+  }
+] 
