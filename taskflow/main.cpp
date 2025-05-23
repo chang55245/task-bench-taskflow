@@ -20,6 +20,8 @@
 #include <unistd.h>
 #include <vector>
 #include <memory>
+#include <atomic>
+#include <thread>
 #include <taskflow/taskflow.hpp>
 #include "core.h"
 #include "timer.h"
@@ -57,7 +59,7 @@ struct TaskflowApp : public App {
   void execute_timestep(size_t idx, long t, tf::Taskflow& taskflow, 
                        std::vector<std::vector<tf::Task>>& task_matrix);
 private:
-  tf::Task create_task(const task_args_t *args, int num_args, payload_t payload, 
+  tf::Task create_task(const std::vector<task_args_t>& args, payload_t payload, 
                       size_t graph_id, tf::Taskflow& taskflow);
   void debug_printf(int verbose_level, const char *format, ...);
 private:
@@ -143,7 +145,8 @@ void TaskflowApp::execute_main_loop()
   tf::Executor executor(nb_workers);
   tf::Taskflow taskflow;
   
-  // Create task matrix to store task references for dependency setup
+  // Create task matrices to store task references for dependency setup
+  // We need a map from (timestep, x) -> task for dependency linking
   std::vector<std::vector<std::vector<tf::Task>>> all_task_matrices(graphs.size());
   
   // Build the complete task graph
@@ -151,8 +154,13 @@ void TaskflowApp::execute_main_loop()
     const TaskGraph &g = graphs[i];
     all_task_matrices[i].resize(g.timesteps);
     
+    // Initialize task matrix with proper dimensions
     for (int t = 0; t < g.timesteps; t++) {
       all_task_matrices[i][t].resize(g.max_width);
+    }
+    
+    // Create all tasks first
+    for (int t = 0; t < g.timesteps; t++) {
       execute_timestep(i, t, taskflow, all_task_matrices[i]);
     }
   }
@@ -225,34 +233,41 @@ void TaskflowApp::execute_timestep(size_t idx, long t, tf::Taskflow& taskflow,
     payload.x = x;
     payload.graph = g;
     
+    // Copy args to a vector to avoid capture issues
+    std::vector<task_args_t> args_vec(args, args + num_args);
+    
     // Create the task and store it in the task matrix
-    task_matrix[t][x] = create_task(args, num_args, payload, idx, taskflow);
+    task_matrix[t][x] = create_task(args_vec, payload, idx, taskflow);
     
     // Set up dependencies with previous timestep tasks
     if (t > 0) {
       for (int arg_idx = 1; arg_idx < num_args; arg_idx++) {
         int dep_x = args[arg_idx].x;
         if (dep_x >= 0 && dep_x < g.max_width) {
-          task_matrix[t-1][dep_x].precede(task_matrix[t][x]);
+          // Make sure the dependency task exists
+          if (!task_matrix[t-1][dep_x].empty()) {
+            task_matrix[t-1][dep_x].precede(task_matrix[t][x]);
+          }
         }
       }
     }
   }
 }
 
-tf::Task TaskflowApp::create_task(const task_args_t *args, int num_args, payload_t payload, 
+tf::Task TaskflowApp::create_task(const std::vector<task_args_t>& args, payload_t payload, 
                                  size_t graph_id, tf::Taskflow& taskflow)
 {
   tile_t *mat = matrix[graph_id].data;
   int x0 = args[0].x;
   int y0 = args[0].y;
+  int num_args = args.size();
   
-  // Create a lambda that captures all necessary data
+  // Create a lambda that captures all necessary data by value
   auto task_lambda = [this, mat, args, num_args, payload, graph_id, x0, y0]() {
     // Get worker ID for scratch memory (approximation since Taskflow doesn't expose worker ID directly)
-    static thread_local int worker_id = 0;
+    static thread_local int worker_id = -1;
     static std::atomic<int> worker_counter{0};
-    if (worker_id == 0) {
+    if (worker_id == -1) {
       worker_id = worker_counter.fetch_add(1) % nb_workers;
     }
     
@@ -311,9 +326,9 @@ int main(int argc, char ** argv)
   // Create a new argv array with the desired arguments
   const char* new_argv[] = {
     "taskflow_main",  // program name
-    "-steps", "4",
+    "-steps", "8",
     "-width", "8", 
-    "-type", "tree",
+    "-type", "fft",
     "-kernel", "compute_bound",
     "-iter", "4096",
     "-worker", "16"
